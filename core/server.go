@@ -2,8 +2,11 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"math/rand"
+	"net"
 	"net/http"
 	"time"
 
@@ -355,8 +358,7 @@ func (s *Server) readPump(ctx context.Context, connCancel context.CancelFunc, c 
 	for {
 		_, data, err := c.ws.Read(ctx)
 		if err != nil {
-			if websocket.CloseStatus(err) != websocket.StatusNormalClosure &&
-				websocket.CloseStatus(err) != websocket.StatusGoingAway {
+			if !isBenignClose(err) {
 				s.onError(ctx, c, err)
 				s.metrics.IncErrors()
 			}
@@ -393,6 +395,33 @@ func (s *Server) readPump(ctx context.Context, connCancel context.CancelFunc, c 
 			cancel()
 		}
 	}
+}
+
+// isBenignClose reports whether a readPump error is an ordinary disconnect
+// rather than a fault worth surfacing to OnError. OnDisconnect still fires for
+// every path, so nothing is lost by staying quiet here.
+//
+// Beyond the two codes a well-behaved peer sends explicitly, this covers:
+//   - StatusNoStatusRcvd (1005): the peer sent a close frame with an empty
+//     payload. Browsers do this for WebSocket.close() with no arguments, which
+//     makes it the most common close on page unload, reload or reconnect.
+//   - StatusAbnormalClosure (1006): the TCP connection went away without a
+//     close handshake — network loss, mobile handover, load balancer reaping.
+//   - net.ErrClosed / io.EOF / context cancellation: writePump's defer calls
+//     CloseNow() deliberately to unblock the Read below, and the request
+//     context is cancelled once the client is gone, so these are self-inflicted
+//     rather than client faults.
+func isBenignClose(err error) bool {
+	switch websocket.CloseStatus(err) {
+	case websocket.StatusNormalClosure,
+		websocket.StatusGoingAway,
+		websocket.StatusNoStatusRcvd,
+		websocket.StatusAbnormalClosure:
+		return true
+	}
+	return errors.Is(err, net.ErrClosed) ||
+		errors.Is(err, io.EOF) ||
+		errors.Is(err, context.Canceled)
 }
 
 // writePump drains sendCh and handles heartbeat pings.
